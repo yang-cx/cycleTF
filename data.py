@@ -1,12 +1,12 @@
 # ---------------------------
-# SCRIPT: data.py
+# SCRIPT: data.py (Modified)
 # ---------------------------
 
 # Standard library
 import os
 import yaml
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 # Third-party libraries
 import torch
@@ -44,7 +44,7 @@ def load_salt_model_from_config(base_config_path, user_config_path, ckpt_path, *
     model = ModelWrapper.load_from_checkpoint(ckpt_path, config=config, **kwargs)
     return model.to(DEVICE).eval(), config
 
-# --- 1. The High-Performance Sampler ---
+# --- 1. The High-Performance Sampler (Unchanged) ---
 class OriginalLikeBatchSampler(Sampler):
     """
     A batch sampler that yields slices, allowing for direct, chunked reading
@@ -76,11 +76,15 @@ class OriginalLikeBatchSampler(Sampler):
             start, stop = int(self.n_batches) * self.batch_size, self.dataset_length
             yield np.s_[int(start):int(stop)]
 
-# --- 2. The High-Performance Constituent Dataset ---
+# --- 2. The High-Performance Constituent Dataset (MODIFIED) ---
 class FastOriginalDataset(Dataset):
     """
     A PyTorch Dataset designed for fast, parallelized reading from a single HDF5 file.
     Each worker opens its own file handle, and it reads data in batches (slices).
+
+    MODIFIED: This dataset now returns a tuple of two dictionaries:
+    1. inputs: Contains the feature tensors with NaNs replaced by 0.0.
+    2. masks: Contains boolean masks where True indicates a padded (originally NaN) value.
     """
     def __init__(self, file_path, variables: Dict[str, List[str]], input_map: Dict[str, str] = None,
                  constituent_name: str = "constituents"):
@@ -104,12 +108,13 @@ class FastOriginalDataset(Dataset):
         self.dsets = {name: self.file[dset_name] for name, dset_name in self.input_map.items()}
         self.arrays = {name: np.array([], dtype=dset.dtype) for name, dset in self.dsets.items()}
 
-    def __getitem__(self, slice_obj: slice):
+    def __getitem__(self, slice_obj: slice) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         if self.file is None:
             self._initialize_worker()
 
         batch_size = slice_obj.stop - slice_obj.start
         inputs = {}
+        masks = {} # NEW: Dictionary to store padding masks
 
         for name, features in self.variables.items():
             batch_array = self.arrays[name]
@@ -118,38 +123,56 @@ class FastOriginalDataset(Dataset):
             self.dsets[name].read_direct(batch_array, source_sel=slice_obj)
 
             unstructured_array = s2u(batch_array[features], dtype=np.float32)
-            inputs[name] = torch.from_numpy(unstructured_array)
+            raw_tensor = torch.from_numpy(unstructured_array)
 
-        return inputs
+            # --- NEW: Generate mask from NaNs and then clean the tensor ---
+            # The mask is True where values are NaN (i.e., padded).
+            # This is the convention expected by PyTorch's attention mechanisms.
+            masks[name] = torch.isnan(raw_tensor)
 
-# --- 3. The Paired Dataset for CycleGAN ---
+            # Replace NaNs with 0.0 for safe processing in the model.
+            inputs[name] = torch.nan_to_num(raw_tensor, nan=0.0)
+
+        # MODIFIED: Return both the cleaned inputs and the corresponding masks.
+        return inputs, masks
+
+# --- 3. The Paired Dataset for CycleGAN (MODIFIED) ---
 class PairedFastDataset(Dataset):
     """
     A wrapper dataset that pairs two FastOriginalDataset instances for CycleGAN.
     It takes a slice and fetches the corresponding batch from both Domain A and Domain B.
+
+    MODIFIED: This dataset now returns the cleaned data along with the padding masks
+    for the constituents from each domain.
     """
     def __init__(self, file_path_A: str, file_path_B: str, variables: dict, input_map: dict, constituent_name: str):
         self.dset_A = FastOriginalDataset(file_path_A, variables, input_map, constituent_name)
         self.dset_B = FastOriginalDataset(file_path_B, variables, input_map, constituent_name)
+        self.constituent_name = constituent_name
         self._len = min(len(self.dset_A), len(self.dset_B))
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, slice_obj: slice):
-        # Fetch a batch from each domain using the same slice
-        batch_A = self.dset_A[slice_obj]
-        batch_B = self.dset_B[slice_obj]
+        # MODIFIED: Unpack the new return signature (inputs, masks)
+        batch_A, masks_A = self.dset_A[slice_obj]
+        batch_B, masks_B = self.dset_B[slice_obj]
 
         jets_A = batch_A['jets']
         jets_B = batch_B['jets']
-        constituents_A = batch_A['constituents']
-        constituents_B = batch_B['constituents']
-        
-        # The model's training step only needs these four tensors
-        return (jets_A, jets_B, constituents_A, constituents_B)
+        constituents_A = batch_A[self.constituent_name]
+        constituents_B = batch_B[self.constituent_name]
 
-# --- 4. The Main High-Performance Lightning DataModule for CycleGAN ---
+        # NEW: Extract the masks corresponding to the constituents
+        # The mask will have shape (batch, n_constituents)
+        constituent_mask_A = masks_A[self.constituent_name].any(dim=-1)
+        constituent_mask_B = masks_B[self.constituent_name].any(dim=-1)
+
+        # MODIFIED: Return the masks as additional items in the tuple
+        return (jets_A, jets_B, constituents_A, constituents_B, constituent_mask_A, constituent_mask_B)
+
+# --- 4. The Main High-Performance Lightning DataModule for CycleGAN (MODIFIED) ---
 class TransformerCycleGANDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -185,7 +208,6 @@ class TransformerCycleGANDataModule(pl.LightningDataModule):
             )
             print(f"Setup complete. Train size: {len(self.train_dataset)}, Val size: {len(self.val_dataset)}")
 
-            # Calculate normalization stats using a subset of the training data
             self._calculate_normalization_stats()
 
     def _calculate_normalization_stats(self):
@@ -193,10 +215,17 @@ class TransformerCycleGANDataModule(pl.LightningDataModule):
         print(f"Calculating shared normalization stats from {self.hparams.num_batches_for_stats} training batches...")
         
         temp_loader = self._get_dataloader(self.train_dataset, shuffle=True)
+        
+        # Get feature counts from the first batch
+        _, _, temp_real, _, _, _ = next(iter(temp_loader))
+        num_const_features = temp_real.shape[-1]
+        
+        temp_loader = self._get_dataloader(self.train_dataset, shuffle=True)
 
-        const_sum = 0
-        const_sq_sum = 0
-        const_count = 0
+        const_sum = torch.zeros(num_const_features)
+        const_sq_sum = torch.zeros(num_const_features)
+        const_count = torch.zeros(num_const_features)
+
         cond_sum = 0
         cond_sq_sum = 0
         total_jets = 0
@@ -205,38 +234,54 @@ class TransformerCycleGANDataModule(pl.LightningDataModule):
             if i >= self.hparams.num_batches_for_stats:
                 break
             
-            (jets_A, jets_B, real_A, real_B) = batch
+            # MODIFIED: Unpack the new 6-item tuple which includes masks
+            (jets_A, jets_B, real_A, real_B, mask_A, mask_B) = batch
             
-            mask_A_expanded = ~(real_A[:, :, 0] == 0).unsqueeze(-1)
-            mask_B_expanded = ~(real_B[:, :, 0] == 0).unsqueeze(-1)
+            # MODIFIED: The normalization logic is now simpler and more robust.
+            # `real_A` and `real_B` are already cleaned (NaNs are 0).
+            # We use the provided masks to get the correct count of non-padded elements.
+            # The mask is True for padded, so we invert it (~mask) to count real elements.
             
-            # Accumulate from both A and B domains into shared variables
-            valid_A = real_A * mask_A_expanded
-            valid_B = real_B * mask_B_expanded
+            # Sum the cleaned tensors. This is safe because NaNs are already 0.
+            const_sum += real_A.sum(dim=(0, 1)) + real_B.sum(dim=(0, 1))
+            const_sq_sum += (real_A ** 2).sum(dim=(0, 1)) + (real_B ** 2).sum(dim=(0, 1))
             
-            const_sum += valid_A.sum(dim=(0, 1)) + valid_B.sum(dim=(0, 1))
-            const_sq_sum += (valid_A ** 2).sum(dim=(0, 1)) + (valid_B ** 2).sum(dim=(0, 1))
-            const_count += mask_A_expanded.sum(dim=(0, 1)) + mask_B_expanded.sum(dim=(0, 1))
+            # Count only the real, non-padded elements using the inverted mask.
+            # We expand the mask to match the feature dimension for per-feature counting.
+            valid_elements_A = (~mask_A).unsqueeze(-1).expand_as(real_A)
+            valid_elements_B = (~mask_B).unsqueeze(-1).expand_as(real_B)
+            const_count += valid_elements_A.sum(dim=(0, 1)) + valid_elements_B.sum(dim=(0, 1))
             
+            # Condition (jet) stats are calculated as before
             cond_sum += jets_A.sum(dim=0) + jets_B.sum(dim=0)
             cond_sq_sum += (jets_A ** 2).sum(dim=0) + (jets_B ** 2).sum(dim=0)
             total_jets += jets_A.shape[0] * 2
 
+        # Avoid division by zero if a feature has no valid elements
+        const_count = torch.clamp(const_count, min=1)
+
         # Calculate and save the single, shared stats
         self.const_mean = const_sum / const_count
         const_var = (const_sq_sum / const_count) - (self.const_mean ** 2)
-        self.const_std = torch.sqrt(torch.abs(const_var)) # Use abs for stability
+        self.const_std = torch.sqrt(torch.abs(const_var))
 
         self.cond_mean = cond_sum / total_jets
         cond_var = (cond_sq_sum / total_jets) - (self.cond_mean ** 2)
         self.cond_std = torch.sqrt(torch.abs(cond_var))
 
+        self.const_std = torch.clamp(self.const_std, min=1e-8)
+        self.cond_std = torch.clamp(self.cond_std, min=1e-8)
+
+        print(f"Constituent Mean: {self.const_mean}")
+        print(f"Constituent Std: {self.const_std}")
+        print(f"Condition Mean: {self.cond_mean}")
+        print(f"Condition Std: {self.cond_std}")
         print("Shared normalization stats calculated successfully.")
         
     def _get_dataloader(self, dataset, shuffle=False):
         return DataLoader(
             dataset=dataset,
-            batch_size=None,  # Crucial for the custom sampler
+            batch_size=None,
             sampler=OriginalLikeBatchSampler(dataset, self.hparams.batch_size, shuffle=shuffle, drop_last=True),
             num_workers=self.hparams.num_workers,
             pin_memory=True,

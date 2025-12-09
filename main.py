@@ -3,6 +3,7 @@
 # ---------------------------
 import itertools
 import os
+import comet_ml
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -15,7 +16,7 @@ from ignite.metrics import MaximumMeanDiscrepancy
 import copy
 
 # Import the high-performance datamodule from data.py
-from data import TransformerCycleGANDataModule
+from data import TransformerCycleGANDataModule, load_salt_model_from_config
 
 # ---------------------------
 # TRANSFORMER BACKBONES FOR CYCLEGAN
@@ -27,37 +28,28 @@ class GeneratorTransformer(nn.Module):
     It takes constituents and a global condition vector, and learns a residual transformation for energy.
     """
     def __init__(self, constituent_features: int, condition_dim: int, embed_dim: int,
-                 num_heads: int, num_layers: int, ff_dim: int, max_constituents: int, dropout: float = 0.1):
+                 num_heads: int, num_layers: int, ff_dim: int, max_constituents: int, dropout: float = 0):
         super().__init__()
         self.input_projection = nn.Linear(constituent_features + condition_dim, embed_dim)
-        self.positional_encoding = nn.Embedding(max_constituents, embed_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
-            dropout=dropout, batch_first=True, norm_first=True
+            dropout=dropout, batch_first=True, norm_first=True # norm_first is generally more stable
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         self.output_projection = nn.Linear(embed_dim, 1)
 
-        # Initialize the final layer to be near-zero to encourage identity mapping at the start
-        nn.init.zeros_(self.output_projection.weight)
-        nn.init.zeros_(self.output_projection.bias)
-
-        self.dropout = nn.Dropout(dropout)
-
     def forward(self, constituents: torch.Tensor, mask: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length, _ = constituents.shape
-
+        
         condition_expanded = condition.unsqueeze(1).expand(-1, seq_length, -1)
         combined_input = torch.cat([constituents, condition_expanded], dim=-1)
-
+        
         x = self.input_projection(combined_input)
-        positions = torch.arange(0, seq_length, device=constituents.device).expand(batch_size, seq_length)
-        x = x + self.positional_encoding(positions)
-        x = self.dropout(x)
-
+        
         transformed_x = self.transformer_encoder(x, src_key_padding_mask=mask)
+        
         delta_E = self.output_projection(transformed_x)
         delta_constituents = torch.zeros_like(constituents)
         delta_constituents[:, :, 0] = delta_E.squeeze(-1)
@@ -70,39 +62,36 @@ class DiscriminatorTransformer(nn.Module):
     A Transformer-based discriminator (critic) for distinguishing real vs. fake sets of jet constituents.
     """
     def __init__(self, constituent_features: int, condition_dim: int, embed_dim: int,
-                 num_heads: int, num_layers: int, ff_dim: int, max_constituents: int, dropout: float = 0.1):
+                 num_heads: int, num_layers: int, ff_dim: int, max_constituents: int, dropout: float = 0):
         super().__init__()
-        self.input_projection = spectral_norm(nn.Linear(constituent_features + condition_dim, embed_dim))
-        self.positional_encoding = nn.Embedding(max_constituents, embed_dim)
+        self.input_projection = nn.Linear(constituent_features + condition_dim, embed_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
-            dropout=dropout, batch_first=True, norm_first=True
+            dropout=dropout, batch_first=True, norm_first=True # norm_first is generally more stable
         )
-        encoder_layer.linear1 = spectral_norm(encoder_layer.linear1)
-        encoder_layer.linear2 = spectral_norm(encoder_layer.linear2)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         self.critic_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            spectral_norm(nn.Linear(embed_dim, 1))
+            # nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, 1)
         )
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, constituents: torch.Tensor, mask: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length, _ = constituents.shape
         condition_expanded = condition.unsqueeze(1).expand(-1, seq_length, -1)
         combined_input = torch.cat([constituents, condition_expanded], dim=-1)
+
         x = self.input_projection(combined_input)
-        positions = torch.arange(0, seq_length, device=constituents.device).expand(batch_size, seq_length)
-        x = x + self.positional_encoding(positions)
-        x = self.dropout(x)
+        
         transformed_x = self.transformer_encoder(x, src_key_padding_mask=mask)
-        mask_expanded = ~mask.unsqueeze(-1).expand_as(transformed_x)
+        
+        # Masked average pooling to get a single vector per jet
+        mask_expanded = ~mask.unsqueeze(-1) # Invert mask (True for valid tokens) and expand
         pooled_input = transformed_x * mask_expanded
         num_valid_tokens = mask_expanded.sum(dim=1)
-        # Add epsilon for numerical stability
         pooled_output = pooled_input.sum(dim=1) / (num_valid_tokens + 1e-8)
+        
         score = self.critic_head(pooled_output)
         return score
 
@@ -149,45 +138,35 @@ class TransformerCycleGANLightning(pl.LightningModule):
         self.criterionCycle = nn.L1Loss()
         self.criterionIdentity = nn.L1Loss()
         
-        # Define a SINGLE set of placeholders for normalization stats
-        # These will be populated in the setup() hook from the datamodule
         self.register_buffer('const_mean', torch.zeros(cfg['constituent_features']))
         self.register_buffer('const_std', torch.ones(cfg['constituent_features']))
         self.register_buffer('cond_mean', torch.zeros(cfg['condition_dim']))
         self.register_buffer('cond_std', torch.ones(cfg['condition_dim']))
 
     def setup(self, stage: str):
-        """Called by PyTorch Lightning to set up the model."""
-        # Get normalization stats from the datamodule once at the start of 'fit'
         if stage == 'fit':
             print("Fetching shared normalization statistics from datamodule.")
             dm = self.trainer.datamodule
-            # Move shared stats to the correct device and save them as buffers
             self.const_mean = dm.const_mean.clone().to(self.device)
             self.const_std = dm.const_std.clone().to(self.device)
             self.cond_mean = dm.cond_mean.clone().to(self.device)
             self.cond_std = dm.cond_std.clone().to(self.device)
 
-        # Initialize the energy model (if used) within the setup hook to ensure correct device placement
         if self.hparams.salt_config and self.lambda_energy > 0 and not hasattr(self, 'energy_MLP'):
-            from data import load_salt_model_from_config
             energy_model, _ = load_salt_model_from_config(
                 self.hparams.salt_config["base_config"],
                 self.hparams.salt_config["user_config"],
                 self.hparams.salt_config["ckpt_path"]
             )
             self.energy_MLP = copy.deepcopy(energy_model.model.tasks[0].net)
-            self.energy_MLP.to(self.device)
             self.set_requires_grad(self.energy_MLP, False)
             self.energy_loss_fn = nn.L1Loss()
             del energy_model
 
     def _normalize(self, tensor, mean, std):
-        """Applies Z-score normalization."""
         return (tensor - mean) / (std + 1e-8)
 
     def _denormalize(self, tensor, mean, std):
-        """Reverts Z-score normalization."""
         return tensor * (std + 1e-8) + mean
     
     def set_requires_grad(self, nets, requires_grad=False):
@@ -198,14 +177,12 @@ class TransformerCycleGANLightning(pl.LightningModule):
                     param.requires_grad = requires_grad
 
     def _masked_global_avg_pool(self, constituents, mask):
-        mask_expanded = ~mask.unsqueeze(-1).expand_as(constituents)
+        mask_expanded = ~mask.unsqueeze(-1)
         pooled_input = constituents * mask_expanded
         num_valid_tokens = mask_expanded.sum(dim=1)
         return pooled_input.sum(dim=1) / (num_valid_tokens + 1e-8)
 
     def forward(self, consts_A, mask_A, consts_B, mask_B, cond_A, cond_B):
-        """Forward pass for inference/prediction."""
-        # Use shared stats for normalization/denormalization
         consts_A_norm = self._normalize(consts_A, self.const_mean, self.const_std)
         consts_B_norm = self._normalize(consts_B, self.const_mean, self.const_std)
         cond_A_norm = self._normalize(cond_A, self.cond_mean, self.cond_std)
@@ -246,19 +223,15 @@ class TransformerCycleGANLightning(pl.LightningModule):
         return ((grad_norm - 1) ** 2).mean()
 
     def training_step(self, batch, batch_idx):
-        (jets_A, jets_B, real_A, real_B, *_) = batch
+        (jets_A, jets_B, real_A, real_B, mask_A, mask_B) = batch
+        
         opt_G, opt_D = self.optimizers()
-
-        mask_A = (real_A[:, :, 0] == 0)
-        mask_B = (real_B[:, :, 0] == 0)
-
-        # Normalize all inputs with the shared stats
+        
         real_A_norm = self._normalize(real_A, self.const_mean, self.const_std)
         real_B_norm = self._normalize(real_B, self.const_mean, self.const_std)
         cond_A_norm = self._normalize(jets_A, self.cond_mean, self.cond_std)
         cond_B_norm = self._normalize(jets_B, self.cond_mean, self.cond_std)
-
-        # Generate fake samples on the normalized scale
+        
         fake_B_norm = self.netG_A(real_A_norm, mask_A, cond_A_norm)
         fake_A_norm = self.netG_B(real_B_norm, mask_B, cond_B_norm)
 
@@ -267,12 +240,7 @@ class TransformerCycleGANLightning(pl.LightningModule):
         opt_D.zero_grad()
         
         loss_D_A = self.netD_A(fake_B_norm.detach(), mask_A, cond_A_norm).mean() - self.netD_A(real_B_norm, mask_B, cond_B_norm).mean()
-        # gp_A = self.compute_gradient_penalty(self.netD_A, real_B_norm, fake_B_norm.detach(), mask_B, cond_B_norm)
-        # loss_D_A += self.lambda_gp * gp_A
-        
         loss_D_B = self.netD_B(fake_A_norm.detach(), mask_B, cond_B_norm).mean() - self.netD_B(real_A_norm, mask_A, cond_A_norm).mean()
-        # gp_B = self.compute_gradient_penalty(self.netD_B, real_A_norm, fake_A_norm.detach(), mask_A, cond_A_norm)
-        # loss_D_B += self.lambda_gp * gp_B
         
         loss_D_total = loss_D_A + loss_D_B
         self.manual_backward(loss_D_total)
@@ -283,23 +251,19 @@ class TransformerCycleGANLightning(pl.LightningModule):
         self.set_requires_grad([self.netD_A, self.netD_B], False)
         opt_G.zero_grad()
 
-        # Adversarial losses
         loss_G_A = -self.netD_A(fake_B_norm, mask_A, cond_A_norm).mean()
         loss_G_B = -self.netD_B(fake_A_norm, mask_B, cond_B_norm).mean()
 
-        # Cycle consistency losses (on the normalized scale)
         rec_A_norm = self.netG_B(fake_B_norm, mask_A, cond_A_norm)
         loss_cycle_A = self.criterionCycle(rec_A_norm[:, :, 0], real_A_norm[:, :, 0]) * self.lambda_a
         rec_B_norm = self.netG_A(fake_A_norm, mask_B, cond_B_norm)
         loss_cycle_B = self.criterionCycle(rec_B_norm[:, :, 0], real_B_norm[:, :, 0]) * self.lambda_b
 
-        # Identity losses (on the normalized scale)
         id_output_A_norm = self.netG_A(real_B_norm, mask_B, cond_B_norm)
         loss_id_A = self.criterionIdentity(id_output_A_norm[:, :, 0], real_B_norm[:, :, 0]) * self.lambda_id * self.lambda_b
         id_output_B_norm = self.netG_B(real_A_norm, mask_A, cond_A_norm)
         loss_id_B = self.criterionIdentity(id_output_B_norm[:, :, 0], real_A_norm[:, :, 0]) * self.lambda_id * self.lambda_a
 
-        # Energy loss (pass original, un-normalized data)
         fake_B_denorm = self._denormalize(fake_B_norm, self.const_mean, self.const_std)
         energy_loss_A = self.compute_energy_loss(real_A, fake_B_denorm, mask_A, mask_A)
         fake_A_denorm = self._denormalize(fake_A_norm, self.const_mean, self.const_std)
@@ -309,7 +273,6 @@ class TransformerCycleGANLightning(pl.LightningModule):
                         loss_id_A + loss_id_B + energy_loss_A + energy_loss_B)
 
         self.manual_backward(loss_G_total)
-        # Add gradient clipping for generator stability
         torch.nn.utils.clip_grad_norm_(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), 1.0)
         opt_G.step()
         
@@ -321,17 +284,13 @@ class TransformerCycleGANLightning(pl.LightningModule):
         }, prog_bar=True)
 
     def validation_step(self, batch, batch_idx):
-        (jets_A, jets_B, real_A, real_B, *_) = batch
-        mask_A = (real_A[:, :, 0] == 0)
-        mask_B = (real_B[:, :, 0] == 0)
-
-        # Normalize inputs for validation with shared stats
+        (jets_A, jets_B, real_A, real_B, mask_A, mask_B) = batch
+        
         real_A_norm = self._normalize(real_A, self.const_mean, self.const_std)
         real_B_norm = self._normalize(real_B, self.const_mean, self.const_std)
         cond_A_norm = self._normalize(jets_A, self.cond_mean, self.cond_std)
         cond_B_norm = self._normalize(jets_B, self.cond_mean, self.cond_std)
 
-        # Generate fakes and reconstructions on the normalized scale
         fake_B_norm = self.netG_A(real_A_norm, mask_A, cond_A_norm)
         rec_A_norm = self.netG_B(fake_B_norm, mask_A, cond_A_norm)
         fake_A_norm = self.netG_B(real_B_norm, mask_B, cond_B_norm)
@@ -353,13 +312,12 @@ class TransformerCycleGANLightning(pl.LightningModule):
         lr_cfg = self.hparams.lr_config
         opt_cfg = self.hparams.optimizer_config
         optimizer_class = getattr(torch.optim, opt_cfg['optimizer_class'])
-        # Use betas common for GAN training for more stability
         if 'betas' not in opt_cfg['optimizer_params']:
              opt_cfg['optimizer_params']['betas'] = (0.5, 0.999)
         opt_G = optimizer_class(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), lr=lr_cfg['initial_lr'], **opt_cfg['optimizer_params'])
         opt_D = optimizer_class(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=lr_cfg['initial_lr'], **opt_cfg['optimizer_params'])
         optimizers = [opt_G, opt_D]
-        if lr_cfg['scheduler_class'] is not None:
+        if lr_cfg.get('scheduler_class') is not None:
             scheduler_class = getattr(torch.optim.lr_scheduler, lr_cfg['scheduler_class'])
             sched_G = scheduler_class(opt_G, **lr_cfg['scheduler_params'])
             sched_D = scheduler_class(opt_D, **lr_cfg['scheduler_params'])
@@ -387,6 +345,7 @@ class LoggerSaveConfigCallback(SaveConfigCallback):
 # CLI ENTRYPOINT
 # ---------------------------
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
     torch.set_float32_matmul_precision('highest')
     cli = LightningCLI(
         model_class=TransformerCycleGANLightning,

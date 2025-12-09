@@ -2,7 +2,7 @@
 seed_everything: 42
 model:
   lr_config:
-    initial_lr: 0.0001
+    initial_lr: 5e-7
     scheduler_class: null
     scheduler_params: {}
   optimizer_config:
@@ -10,13 +10,13 @@ model:
     optimizer_params:
       betas: [0.5, 0.99]
   cycleGAN_config:
-    constituent_features: 4
-    condition_dim: 2
+    constituent_features: 7
+    condition_dim: 6
     max_constituents: 500
     embed_dim: 128
     num_heads: 4
-    num_layers: 4
-    ff_dim: 512
+    num_layers: 2
+    ff_dim: 256
     lambda_a: 10.0
     lambda_b: 10.0
     lambda_id: 0.5
@@ -26,6 +26,8 @@ model:
     base_config: "/global/cfs/projectdirs/atlas/cxyang/EGamma/salt/salt/configs/base.yaml"
     user_config: "/global/cfs/projectdirs/atlas/cxyang/EGamma/bestModels/Electron_Cali_v31_flash_20250516-T041026/config.yaml"
     ckpt_path: "/global/cfs/projectdirs/atlas/cxyang/EGamma/bestModels/Electron_Cali_v31_flash_20250516-T041026/ckpts/epoch=090-val_loss=0.00000.ckpt"
+  plot_config:
+    n_examples_to_plot: &n_examples 5
 
 data:
   mc_files:
@@ -35,17 +37,36 @@ data:
     train: "/global/cfs/cdirs/atlas/cxyang/EGamma/nTuples_Jun25_layer/user.yangc.Jun25_layer.data22_13p6TeV.periodAllYear.physics_Main.PhysCont.DAOD_EGAM1.grp22_v01_p6000_EXT0/merged/user.yangc.45366333.EXT0_train_real.h5"
     val: "/global/cfs/cdirs/atlas/cxyang/EGamma/nTuples_Jun25_layer/user.yangc.Jun25_layer.data22_13p6TeV.periodAllYear.physics_Main.PhysCont.DAOD_EGAM1.grp22_v01_p6000_EXT0/merged/user.yangc.45366333.EXT0_val_real.h5"
   variables:
-    jets: ['E', 'pt']
-    constituents: ['cells_E', 'cells_eta', 'cells_phi', 'cells_layer']
+    #   jets:
+    #   - ECells_Sum_fl32
+    #   - etaCalo
+    #   - phiCalo
+    #   - rawE1overE2
+    #   - f0
+    #   - fTG3
+    # consts:
+    #   - cells_E
+    #   - cells_eta
+    #   - cells_phi
+    #   - cells_x
+    #   - cells_y
+    #   - cells_z
+    #   - cells_layer
+    jets: ['ECells_Sum_fl32', 'etaCalo', 'phiCalo', 'rawE1overE2', 'f0', 'fTG3']
+    constituents: ['cells_E', 'cells_eta', 'cells_phi', 'cells_x', 'cells_y', 'cells_z', 'cells_layer']
   input_map:
     jets: 'jets'
     constituents: 'consts'
   constituent_name: 'constituents'
-  batch_size: 256
-  num_workers: 32
+  batch_size: 1024
+  num_workers: 16
 
 trainer:
-  max_epochs: 50
+  limit_train_batches: 200
+  # fast_dev_run: true
+  precision: bf16-mixed
+  # Expected a typing.Literal['transformer-engine', 'transformer-engine-float16', '16-true', '16-mixed', 'bf16-true', 'bf16-mixed', '32-true', '64-true']
+  max_epochs: 5
   devices: 1
   default_root_dir: "experiments/transformer_cyclegan"
   logger:
